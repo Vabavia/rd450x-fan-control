@@ -28,6 +28,9 @@ type StatusReport struct {
 	Thermals []ThermalStatus `json:"thermals"`
 }
 
+const settingsPath = "/etc/rd450x-fan-control"
+const settingsFile = settingsPath + "/fan_settings.json"
+
 // ipmiRaw executes raw IPMI OEM commands
 func ipmiRaw(args ...string) (string, error) {
 	fullArgs := append([]string{"raw", "0x2e"}, args...)
@@ -130,6 +133,121 @@ func setSpeed(idStr, speedStr string) {
 	} else {
 		fmt.Printf("Fan %s successfully set to %d%%\n", formattedID, speed)
 	}
+}
+
+// saveFanSettings saves the current fan PWM values to a file
+func saveFanSettings() {
+	if os.Getuid() != 0 {
+		fmt.Println("Error: This command requires root privileges to write to", settingsPath)
+		return
+	}
+
+	pwms := getPWMs()
+	if len(pwms) == 0 {
+		fmt.Println("Error: Could not retrieve current fan speeds. Nothing to save.")
+		return
+	}
+
+	// Map fan names to their numeric IDs
+	fanIDs := map[string]string{
+		"System Fan1": "1", "System Fan2": "2", "System Fan3": "3",
+		"System Fan4": "4", "CPU Fan1": "5", "CPU Fan2": "6",
+	}
+
+	settings := make(map[string]string)
+	for name, pwm := range pwms {
+		if id, ok := fanIDs[name]; ok && pwm != "N/A" {
+			settings[id] = strings.TrimSuffix(pwm, "%")
+		}
+	}
+
+	// Ensure the directory exists
+	if err := os.MkdirAll(settingsPath, 0755); err != nil {
+		fmt.Printf("Error creating directory %s: %v\n", settingsPath, err)
+		return
+	}
+
+	file, err := os.Create(settingsFile)
+	if err != nil {
+		fmt.Printf("Error creating settings file: %v\n", err)
+		return
+	}
+	defer func() {
+		if err := file.Close(); err != nil {
+			fmt.Printf("Error closing settings file: %v\n", err)
+		}
+	}()
+
+	encoder := json.NewEncoder(file)
+	encoder.SetIndent("", "  ")
+	if err := encoder.Encode(settings); err != nil {
+		fmt.Printf("Error writing to settings file: %v\n", err)
+		return
+	}
+
+	fmt.Println("Fan settings successfully saved to", settingsFile)
+}
+
+// restoreFanSettings restores fan PWM values from a file
+func restoreFanSettings() {
+	if os.Getuid() != 0 {
+		fmt.Println("Error: This command requires root privileges.")
+		return
+	}
+
+	file, err := os.Open(settingsFile)
+	if err != nil {
+		if os.IsNotExist(err) {
+			fmt.Printf("Error: Settings file not found at %s. Use 'save' command first.\n", settingsFile)
+		} else {
+			fmt.Printf("Error opening settings file: %v\n", err)
+		}
+		return
+	}
+	defer func() {
+		if err := file.Close(); err != nil {
+			fmt.Printf("Error closing settings file: %v\n", err)
+		}
+	}()
+
+	var settings map[string]string
+	decoder := json.NewDecoder(file)
+	if err := decoder.Decode(&settings); err != nil {
+		fmt.Printf("Error reading settings file: %v\n", err)
+		return
+	}
+
+	// Get current status to only set fans that have a different speed
+	currentPWMsHex, err := ipmiRaw("0x31")
+	if err != nil {
+		fmt.Println("Warning: Could not get current fan speeds to compare. Setting all saved fans.")
+		currentPWMsHex = "" // Reset to ensure all fans are set
+	}
+	currentParts := strings.Fields(currentPWMsHex)
+
+	fmt.Println("Restoring fan settings...")
+	for id, speed := range settings {
+		fanID, _ := strconv.Atoi(id)
+		shouldSet := true
+
+		// Check if we need to set the speed
+		if len(currentParts) > fanID {
+			currentSpeedHex := currentParts[fanID]
+			currentSpeed, _ := strconv.ParseInt(currentSpeedHex, 16, 64)
+			savedSpeed, _ := strconv.Atoi(speed)
+
+			if int(currentSpeed) == savedSpeed {
+				shouldSet = false
+				fmt.Printf("  - Fan %s is already at %s%%, skipping.\n", id, speed)
+			}
+		}
+
+		if shouldSet {
+			fmt.Printf("  - Setting Fan %s to %s%%\n", id, speed)
+			setSpeed(id, speed)
+		}
+	}
+	fmt.Println("Fan settings restored.")
 }
 
 // getStatus fetches and displays full sensor telemetry
@@ -263,6 +381,8 @@ func main() {
 		fmt.Println("  rd450x-fan-control status [--json]")
 		fmt.Println("  rd450x-fan-control get <id>")
 		fmt.Println("  rd450x-fan-control set <id|all> <speed>")
+		fmt.Println("  rd450x-fan-control save")
+		fmt.Println("  rd450x-fan-control restore")
 		return
 	}
 
@@ -282,6 +402,10 @@ func main() {
 			return
 		}
 		setSpeed(os.Args[2], os.Args[3])
+	case "save":
+		saveFanSettings()
+	case "restore":
+		restoreFanSettings()
 	case "testrun":
 		fmt.Println("--- STARTING AUTOMATED TEST SEQUENCE ---")
 
